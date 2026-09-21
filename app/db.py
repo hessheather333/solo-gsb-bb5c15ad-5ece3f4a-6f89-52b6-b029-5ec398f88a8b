@@ -102,6 +102,23 @@ def set_sql_fault(match: str | None, allow_matching: int = 0) -> None:
 
 
 @contextmanager
+def read_transaction() -> Iterator[sqlite3.Connection]:
+    """调用方必须已持有 DB_LOCK：在共享连接上开一笔只读事务（BEGIN；无写锁）。
+
+    autocommit 连接上 BEGIN 开启的是延迟（deferred）事务：事务内全部为 SELECT，
+    SQLite 永不升级为写锁，但所有读取都落在**同一读快照**上——跨会话、分片、
+    依赖与时间敏感谓词的多次查询不会被并发写入穿插。退出（含异常）时 ROLLBACK
+    结束只读事务，不产生任何提交。
+    """
+    conn = get_conn()
+    conn.execute("BEGIN")
+    try:
+        yield conn
+    finally:
+        conn.rollback()
+
+
+@contextmanager
 def locked_transaction() -> Iterator[sqlite3.Connection]:
     """调用方必须已持有 DB_LOCK：在共享连接上开一笔显式写事务。
 
