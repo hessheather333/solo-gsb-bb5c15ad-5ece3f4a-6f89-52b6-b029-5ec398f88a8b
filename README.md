@@ -308,7 +308,11 @@ curl -s -X POST http://localhost:8000/sessions/$SID/finalize
   （容量可被同租户新会话使用）；会话行保留作审计，首次对该会话的写操作（领取/上报/
   失败/回退/提交/fork/取消/调度命中）会在同一事务内把它**原子标记为 `cancelled`**
   并清除全部在途租约，此后与显式取消一致拒绝一切写入（`409`）。状态查询中
-  `reservation_expired: true` 表示「仍为 active 但预留已到期」。到期动作不需要后台
+  `reservation_expired: true` 表示「仍为 active 但预留已到期」；就绪查询
+  `GET /sessions/{id}/ready` 对已取消会话返回 `409 session is cancelled`、对
+  active 但预留已到期会话返回 `409 session reservation expired`（此时没有任何分片
+  可被领取，避免把 pending 分片误报为就绪）。**就绪查询是纯只读快照**：不触发惰性
+  取消、不清理任何租约，终态标记仍由首个写操作完成。到期动作不需要后台
   清扫线程，账务在读取时按 `reservation_expires_at > now` 口径实时聚合。
 - **提交原子转量**：`finalize` 成功时会话 `active → finalized`，其 `declared_bytes`
   在同一事务内**从 reserved 移到 used**（两者都是按状态实时 SUM，无独立计数器，
@@ -460,7 +464,7 @@ curl -s -X POST http://localhost:8000/sessions/$SID/finalize
 | `GET` | `/sessions/{session_id}` | 查询会话与逐分片状态（含租户/预留字段、各分片 `dependencies`、`failure_count`、`retry_after`、退避参数、当前 `active_leases`、会话 `revision` 与 `source_session_id`） |
 | `POST` | `/sessions/{session_id}/cancel` | 取消 active 会话：原子释放容量预留并使全部在途租约/验收令牌失效（finalized 409；重复取消幂等） |
 | `POST` | `/sessions/{session_id}/fork` | 进度分支：从 active 会话创建新会话（同租户、复制 declared_bytes 并重新预留；校验修订号/完成状态/传递前置闭包/配额，`request_id` 幂等） |
-| `GET` | `/sessions/{session_id}/ready` | 当前可领取的分片、被依赖阻塞的分片，以及退避冷却中的分片（`cooling_chunks`） |
+| `GET` | `/sessions/{session_id}/ready` | 当前可领取的分片、被依赖阻塞的分片，以及退避冷却中的分片（`cooling_chunks`）；会话、分片、依赖与时钟在同一临界区读取为一致快照，分类与单片/批量领取资格一致。已取消会话返回 409（`session is cancelled`），active 但预留已到期返回 409（`session reservation expired`）；查询纯只读，不触发惰性取消、不清理租约 |
 | `POST` | `/sessions/{session_id}/chunks/{index}/lease` | 领取分片租约（同样受 `max_active_leases` 与退避冷却约束） |
 | `POST` | `/sessions/{session_id}/leases/batch` | 原子批量领取租约（按分片序号，数量不超过 `count` 与剩余并发槽位；自动跳过冷却分片） |
 | `POST` | `/dispatch/lease` | 跨会话公平调度：在候选会话间轮转发一片分片租约（按 `queue_key` 持久化游标，自动跳过不可用/已取消/预留到期会话） |

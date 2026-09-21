@@ -28,7 +28,10 @@
   同一源会话 + request_id 重放返回首次新会话，参数变化返回 409
 - 就绪查询：会话与逐分片状态（含各分片依赖、失败次数与冷却截止时间，以及会话 revision
   与 source_session_id）
-- 就绪查询：当前可领取的分片、被依赖阻塞的分片、退避冷却中的分片以及待验收分片
+- 就绪查询：当前可领取的分片、被依赖阻塞的分片、退避冷却中的分片以及待验收分片；
+  会话、分片、依赖与时钟在同一 DB_LOCK 临界区读取为一致快照，分类与单片/批量领取
+  资格完全一致。已取消或容量预留已到期的会话返回 409；该查询纯只读，不触发惰性
+  取消、不清理任何租约（到期 active 会话的行原样保留，终态标记仍由首个写操作完成）
 - 分片验收队列（可选，创建会话 verification_required=true 启用）：启用后完成上报先进入
   awaiting_verification（不再直接 completed），存在待验收分片时不可 finalize；
   POST /verifications/lease 在同一写锁事务内按完成时间从早到晚领取一个待验收分片，
@@ -982,46 +985,69 @@ def fork_session(session_id: str, req: ForkSessionRequest):
     response_model=ReadyResponse,
     tags=["sessions"],
     summary="查询当前可领取的分片与被依赖阻塞的分片",
+    responses={
+        409: {"description": "会话已取消（session is cancelled），或会话仍为 active 但容量"
+                             "预留已到期（session reservation expired）；两种情况下都不再"
+                             "有任何可领取分片"},
+    },
 )
 def get_ready_chunks(session_id: str):
-    get_session_or_404(session_id)
-    rows = get_conn().execute(
-        "SELECT * FROM chunks WHERE session_id = ? ORDER BY chunk_index",
-        (session_id,),
-    ).fetchall()
-    deps = load_dependencies(session_id)
-    now = utcnow()
+    """纯只读快照：会话行、全部分片行、依赖图与判定时钟在同一个 DB_LOCK 临界区内读取，
+    期间任何领取/上报/失败/回退/取消/提交/惰性到期都无法穿插，因此返回的四个分桶
+    与同一时刻单片/批量领取看到的资格完全一致（依赖完成、有效租约、退避冷却、待验收
+    均复用同一谓词）。
 
-    completed = {r["chunk_index"] for r in rows if r["status"] == "completed"}
-    ready: list[int] = []
-    blocked: list[BlockedChunk] = []
-    cooling: list[CoolingChunk] = []
-    awaiting: list[int] = []
-    for row in rows:
-        chunk_index = row["chunk_index"]
-        if row["status"] == "completed":
-            continue
-        if row["status"] == CHUNK_STATUS_AWAITING_VERIFICATION:
-            # 已完成上报、等待验收：既不可领取也不属于阻塞/冷却，验收后才离开该状态
-            awaiting.append(chunk_index)
-            continue
-        missing_deps = [d for d in deps.get(chunk_index, []) if d not in completed]
-        if missing_deps:
-            blocked.append(
-                BlockedChunk(chunk_index=chunk_index, missing_dependencies=missing_deps)
-            )
-        elif backoff_active(row, now):
-            # 失败退避冷却中：不可被单片或批量领取，冷却结束后自动恢复
-            cooling.append(
-                CoolingChunk(
-                    chunk_index=chunk_index,
-                    failure_count=row["failure_count"] or 0,
-                    retry_after=parse_ts(row["backoff_until"]),
+    已取消或预留已到期的会话一律返回 409：此时任何 pending 分片都不可再被领取，
+    把它们列为 ready 会让调用方拿到永远无法兑现的租约。本端点**只读、不触发惰性
+    取消、不清理任何租约**——预留已到期但尚未被写访问惰性标记的 active 会话在查询后
+    行内容（status / lease_token / lease_expires_at）原样保留，终态标记仍留给首个
+    写操作的独立事务完成。finalized 会话只读且清单不再变化，继续返回 200（各分桶为空）。
+    """
+    with DB_LOCK:
+        now = utcnow()
+        session = get_session_or_404(session_id)
+        if session["status"] == SESSION_STATUS_CANCELLED:
+            raise HTTPException(status_code=409, detail="session is cancelled")
+        if reservation_expired(session, now):
+            raise HTTPException(
+                status_code=409, detail="session reservation expired")
+
+        rows = get_conn().execute(
+            "SELECT * FROM chunks WHERE session_id = ? ORDER BY chunk_index",
+            (session_id,),
+        ).fetchall()
+        deps = load_dependencies(session_id)
+
+        completed = {r["chunk_index"] for r in rows if r["status"] == "completed"}
+        ready: list[int] = []
+        blocked: list[BlockedChunk] = []
+        cooling: list[CoolingChunk] = []
+        awaiting: list[int] = []
+        for row in rows:
+            chunk_index = row["chunk_index"]
+            if row["status"] == "completed":
+                continue
+            if row["status"] == CHUNK_STATUS_AWAITING_VERIFICATION:
+                # 已完成上报、等待验收：既不可领取也不属于阻塞/冷却，验收后才离开该状态
+                awaiting.append(chunk_index)
+                continue
+            missing_deps = [d for d in deps.get(chunk_index, []) if d not in completed]
+            if missing_deps:
+                blocked.append(
+                    BlockedChunk(chunk_index=chunk_index, missing_dependencies=missing_deps)
                 )
-            )
-        elif not lease_valid(row, now):
-            # 无租约或租约已过期，且前置已全部完成：立即可领取
-            ready.append(chunk_index)
+            elif backoff_active(row, now):
+                # 失败退避冷却中：不可被单片或批量领取，冷却结束后自动恢复
+                cooling.append(
+                    CoolingChunk(
+                        chunk_index=chunk_index,
+                        failure_count=row["failure_count"] or 0,
+                        retry_after=parse_ts(row["backoff_until"]),
+                    )
+                )
+            elif not lease_valid(row, now):
+                # 无租约或租约已过期，且前置已全部完成：立即可领取
+                ready.append(chunk_index)
 
     return ReadyResponse(
         session_id=session_id,

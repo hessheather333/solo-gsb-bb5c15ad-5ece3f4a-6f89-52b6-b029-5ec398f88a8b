@@ -351,6 +351,146 @@ def test_ready_unknown_session():
     assert client.get("/sessions/nope/ready").status_code == 404
 
 
+def test_ready_cancelled_session_returns_409_instead_of_false_ready():
+    """取消后在途租约回 pending：/ready 不得把这些 pending 分片报为可领取（虚假就绪），
+    必须返回 409；finalized 会话只读，仍返回 200。"""
+    s = make_session_with_deps(3, {2: [0, 1]})
+    # 分片 0 持有在途租约（取消后会被清回 pending）
+    lease(s["id"], 0)
+    assert ready(s["id"])["ready_chunks"] == [1]
+
+    r = cancel(s["id"])
+    assert r.status_code == 200
+
+    resp = client.get(f"/sessions/{s['id']}/ready")
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == "session is cancelled"
+
+    # 重复取消后仍是 409，不返回任何分片清单
+    assert cancel(s["id"]).status_code == 200
+    resp2 = client.get(f"/sessions/{s['id']}/ready")
+    assert resp2.status_code == 409
+    assert resp2.json()["detail"] == "session is cancelled"
+    assert "ready_chunks" not in resp2.json()
+
+    # finalized 会话保持只读 200（各分桶为空），不属于 409 情形
+    s2 = make_session(total_chunks=1)
+    t = lease(s2["id"], 0).json()["lease_token"]
+    assert complete(s2["id"], 0, t, "0" * 64).status_code == 200
+    assert client.post(f"/sessions/{s2['id']}/finalize").status_code == 200
+    rdy = client.get(f"/sessions/{s2['id']}/ready")
+    assert rdy.status_code == 200
+    assert rdy.json()["ready_chunks"] == []
+    assert rdy.json()["blocked_chunks"] == []
+
+
+def test_ready_expired_reservation_returns_409_without_lazy_cancel_or_lease_cleanup():
+    """预留已到期但仍为 active 的会话：/ready 返回 409（不再有可领取分片），
+    且查询是纯只读——不触发惰性取消、不清理在途租约，会话行与分片行原样保留；
+    终态标记仍由之后的首个写操作完成。"""
+    tid = "tenant-ready-expired"
+    set_quota(tid, 10_000)
+    s = make_session(total_chunks=2, tenant_id=tid, declared_bytes=600,
+                     reservation_ttl_seconds=60)
+    token = lease(s["id"], 0).json()["lease_token"]
+    expire_reservation(s["id"])
+
+    resp = client.get(f"/sessions/{s['id']}/ready")
+    assert resp.status_code == 409
+    assert "expired" in resp.json()["detail"]
+
+    # 未触发惰性取消：会话仍是 active 但标记预留到期
+    st = client.get(f"/sessions/{s['id']}").json()
+    assert st["status"] == "active"
+    assert st["reservation_expired"] is True
+    assert st["cancelled_at"] is None
+
+    # 未清理租约：分片 0 仍持有原租约行（令牌/到期时间保留），分片 1 也仍为 pending
+    row0 = get_conn().execute(
+        "SELECT status, lease_token, lease_expires_at FROM chunks"
+        " WHERE session_id = ? AND chunk_index = 0",
+        (s["id"],),
+    ).fetchone()
+    assert row0["status"] == "leased"
+    assert row0["lease_token"] == token
+    assert row0["lease_expires_at"] is not None
+    row1 = get_conn().execute(
+        "SELECT status FROM chunks WHERE session_id = ? AND chunk_index = 1",
+        (s["id"],),
+    ).fetchone()
+    assert row1["status"] == "pending"
+
+    # 预留仍在到期读口径之外：reserved 已释放（/ready 没有把它重新计回）
+    view = quota_view(tid).json()
+    assert view["reserved_bytes"] == 0
+
+    # 随后首个写操作才执行惰性取消（独立事务落库），与既有语义一致
+    assert lease(s["id"], 1).status_code == 409
+    st2 = client.get(f"/sessions/{s['id']}").json()
+    assert st2["status"] == "cancelled"
+    assert st2["chunks"][0]["status"] == "pending"
+    assert st2["chunks"][0]["lease_expires_at"] is None
+
+    # 惰性取消后 /ready 仍为 409（detail 变为已取消）
+    resp2 = client.get(f"/sessions/{s['id']}/ready")
+    assert resp2.status_code == 409
+    assert resp2.json()["detail"] == "session is cancelled"
+
+
+def test_ready_buckets_match_batch_lease_eligibility_for_active_session():
+    """正常 active 会话：/ready 的分桶与批量领取的实际资格在同一状态下一致——
+    批量恰好发放 ready_chunks（按序号升序），冷却/有效租约/被依赖分片均不发放。"""
+    # 4 个分片：3 依赖 0、1；先完成 0 解锁 2
+    s = make_session_with_deps(4, {3: [0, 1]})
+    t0 = lease(s["id"], 0).json()["lease_token"]
+    assert complete(s["id"], 0, t0, "0" * 64).status_code == 200
+
+    # 分片 1 失败进入退避冷却
+    t1 = lease(s["id"], 1).json()["lease_token"]
+    assert fail(s["id"], 1, t1).status_code == 200
+
+    rdy = ready(s["id"])
+    # ready=[2]（1 在冷却、3 被依赖阻塞）
+    assert rdy["ready_chunks"] == [2]
+    assert [c["chunk_index"] for c in rdy["cooling_chunks"]] == [1]
+    assert rdy["blocked_chunks"] == [{"chunk_index": 3, "missing_dependencies": [1]}]
+
+    # 批量领取只发放 /ready 报告的可领取分片
+    batch = batch_lease(s["id"], 10)
+    assert batch.status_code == 200, batch.text
+    assert [g["chunk_index"] for g in batch.json()["granted"]] == [2]
+
+    # 再次查询：2 持有效租约离开 ready，其余分桶不变
+    rdy2 = ready(s["id"])
+    assert rdy2["ready_chunks"] == []
+    assert [c["chunk_index"] for c in rdy2["cooling_chunks"]] == [1]
+    assert rdy2["blocked_chunks"] == [{"chunk_index": 3, "missing_dependencies": [1]}]
+
+    # 分片 2 租约过期后重新进入 ready，批量又恰好领取它（过期租约视为空闲）
+    expire_lease(s["id"], 2)
+    assert ready(s["id"])["ready_chunks"] == [2]
+    batch2 = batch_lease(s["id"], 10)
+    assert [g["chunk_index"] for g in batch2.json()["granted"]] == [2]
+
+
+def test_ready_awaiting_verification_buckets_match_batch_lease():
+    """启用验收队列的 active 会话：待验收分片在 /ready 单列、不进 ready/blocked/cooling，
+    批量领取同样不会发放它。"""
+    s = make_verification_session(total_chunks=3)
+    lease_complete_awaiting(s["id"], 0)
+    g = verification_lease().json()
+    assert g["session_id"] == s["id"]
+
+    rdy = ready(s["id"])
+    assert rdy["ready_chunks"] == [1, 2]
+    assert rdy["blocked_chunks"] == []
+    assert rdy["cooling_chunks"] == []
+    assert rdy["awaiting_verification_chunks"] == [0]
+
+    batch = batch_lease(s["id"], 10)
+    assert [item["chunk_index"] for item in batch.json()["granted"]] == [1, 2]
+
+
 def test_finalize_with_dependencies():
     s = make_session_with_deps(2, {1: [0]})
     # 被依赖阻塞时无法完成后续分片，提交自然列出缺失
